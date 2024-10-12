@@ -1,61 +1,100 @@
 import streamlit as st
 import numpy as np
-import tensorflow as tf
-from utils import extract_audio_features, reshape_audio_features, get_word2vec_embeddings
+import matplotlib.pyplot as plt
+from utils import get_word2vec_embeddings, extract_audio_features, reshape_audio_features
+from tensorflow.keras.models import load_model
 from gensim.models import Word2Vec
+import speech_recognition as sr
+from pydub import AudioSegment  # Import pydub for audio conversion
+import os
+from moviepy.editor import AudioFileClip
 
-# Load models
-audio_model = tf.keras.models.load_model('audio_model.h5')
-lyrics_model = tf.keras.models.load_model('lyrics_model.h5')
+# Load your models
+audio_model = load_model('audio_model.h5')
+lyrics_model = load_model('lyrics_model.h5')
 
-# Load Word2Vec model (for lyrics processing)
+# Load Word2Vec model
 word2vec_model = Word2Vec.load('word2vec_model.bin')
 
-# Streamlit app
-st.title("Music Genre Classifier")
+# Define genre labels for both models
+audio_model_genres = ['blues' 'classical' 'country' 'disco' 'hiphop' 'jazz' 'metal' 'pop''reggae' 'rock']
+lyrics_model_genres = ['blues', 'classical', 'country', 'hiphop', 'jazz', 'metal', 'pop', 'reggae', 'rock']
 
-# Section 1: Audio-based Classification
-st.header("Classify by Audio Features")
-
-# File uploader for audio
-uploaded_audio = st.file_uploader("Upload an audio file (MP3 or WAV)", type=["mp3", "wav"])
-
-if uploaded_audio is not None:
-    # Save uploaded audio file temporarily
-    audio_path = "temp_audio." + uploaded_audio.name.split('.')[-1]
-    with open(audio_path, "wb") as f:
-        f.write(uploaded_audio.getbuffer())
-
-    # Extract and reshape audio features
-    st.write("Extracting audio features...")
-    audio_features = extract_audio_features(audio_path)
-    reshaped_features = reshape_audio_features(audio_features)
-
-    if reshaped_features is not None:
-        # Predict genre using the audio model
-        audio_probs = audio_model.predict(reshaped_features)
-        st.write("Audio-based prediction:")
-        st.bar_chart(audio_probs)
-    else:
-        st.write("Error: Unable to extract features from the audio.")
-
-# Section 2: Lyrics-based Classification
-st.header("Classify by Lyrics")
-
-# Text input for lyrics
-lyrics_input = st.text_area("Enter song lyrics:")
-
-if lyrics_input:
-    # Process and predict genre from lyrics
-    st.write("Processing lyrics...")
-    lyrics_embeddings = get_word2vec_embeddings(lyrics_input, word2vec_model)
+# Speech Recognition function
+def extract_lyrics(file_path):
+    recognizer = sr.Recognizer()
+    audio_file = sr.AudioFile(file_path)
+    with audio_file as source:
+        audio = recognizer.record(source)
     
-    # Predict genre using the lyrics model
-    lyrics_probs = lyrics_model.predict(np.expand_dims(lyrics_embeddings, axis=0))
-    st.write("Lyrics-based prediction:")
-    st.bar_chart(lyrics_probs)
+    try:
+        lyrics = recognizer.recognize_google(audio)
+        return lyrics
+    except sr.UnknownValueError:
+        st.error("Speech Recognition could not understand the audio.")
+        return None
+    except sr.RequestError:
+        st.error("Error connecting to the Speech Recognition API.")
+        return None
 
-# Clean up temporary audio file if created
-import os
-if uploaded_audio:
-    os.remove(audio_path)
+# Convert MP3 to WAV
+def convert_mp3_to_wav(mp3_file_path):
+    wav_file_path = mp3_file_path.replace('.mp3', '.wav')
+    audio_clip = AudioFileClip(mp3_file_path)
+    audio_clip.write_audiofile(wav_file_path, codec='pcm_s16le')  # Exporting as WAV
+    audio_clip.close()
+    return wav_file_path
+
+# Align predictions
+def align_predictions(audio_preds, lyrics_preds):
+    aligned_lyrics_preds = np.zeros_like(lyrics_preds)
+    genre_mapping = {genre: audio_model_genres.index(genre) for genre in lyrics_model_genres}
+    for i, genre in enumerate(lyrics_model_genres):
+        aligned_lyrics_preds[:, genre_mapping[genre]] = lyrics_preds[:, i]
+    return aligned_lyrics_preds
+
+# Plotting
+def plot_genre_probabilities(probabilities, genres):
+    fig, ax = plt.subplots()
+    ax.barh(genres, probabilities)
+    ax.set_xlabel('Probability')
+    ax.set_title('Genre Prediction')
+    st.pyplot(fig)
+
+# Streamlit app UI
+st.title("Hybrid Music Genre Classifier")
+uploaded_file = st.file_uploader("Upload an mp3 file", type=["mp3"])
+
+if uploaded_file is not None:
+    with open("temp.mp3", "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    
+    # Convert MP3 to WAV
+    wav_file_path = convert_mp3_to_wav("temp.mp3")
+    
+    # Extract audio features
+    audio_features = extract_audio_features(wav_file_path)
+    if audio_features is not None:
+        reshaped_audio_features = reshape_audio_features(audio_features)
+        audio_genre_prediction = audio_model.predict(reshaped_audio_features)
+        
+        # Speech-to-text for lyrics
+        lyrics = extract_lyrics(wav_file_path)
+        if lyrics:
+            st.write(f"Recognized lyrics: {lyrics}")
+            lyrics_embedding = get_word2vec_embeddings(lyrics, word2vec_model)
+            lyrics_embedding = np.expand_dims(lyrics_embedding, axis=0)
+            lyrics_genre_prediction = lyrics_model.predict(lyrics_embedding)
+            
+            # Align lyrics model predictions to audio model genre order
+            aligned_lyrics_genre_prediction = align_predictions(audio_genre_prediction, lyrics_genre_prediction)
+            
+            # Average the predictions
+            combined_genre_probs = (audio_genre_prediction + aligned_lyrics_genre_prediction) / 2
+            
+            # Plot the averaged probabilities
+            plot_genre_probabilities(combined_genre_probs[0], audio_model_genres)
+    
+    # Clean up temporary files
+    os.remove("temp.mp3")
+    os.remove(wav_file_path)
